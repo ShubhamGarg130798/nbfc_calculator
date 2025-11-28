@@ -1,669 +1,1199 @@
 import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import numpy as np
+from datetime import datetime, timedelta
+import calendar
+import requests
+import time
+from zoneinfo import ZoneInfo
+import hashlib
+import json
+import os
 
-# Set page config
+# PASSWORD PROTECTION
+PASSWORD = "nbfcsecure123"
+TOKEN_FILE = "auth_tokens.json"
+
+# Token management functions
+def generate_token():
+    """Generate a secure token"""
+    timestamp = str(datetime.now().timestamp())
+    random_str = os.urandom(16).hex()
+    return hashlib.sha256((timestamp + random_str).encode()).hexdigest()
+
+def save_token(token):
+    """Save token with expiry date"""
+    tokens = load_tokens()
+    expiry = (datetime.now() + timedelta(days=10)).isoformat()
+    tokens[token] = expiry
+    with open(TOKEN_FILE, 'w') as f:
+        json.dump(tokens, f)
+
+def load_tokens():
+    """Load existing tokens"""
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def validate_token(token):
+    """Check if token is valid and not expired"""
+    if not token:
+        return False
+    tokens = load_tokens()
+    if token in tokens:
+        try:
+            expiry = datetime.fromisoformat(tokens[token])
+            if datetime.now() < expiry:
+                return True
+            else:
+                # Remove expired token
+                del tokens[token]
+                with open(TOKEN_FILE, 'w') as f:
+                    json.dump(tokens, f)
+        except:
+            pass
+    return False
+
+def clean_expired_tokens():
+    """Remove all expired tokens"""
+    tokens = load_tokens()
+    now = datetime.now()
+    tokens = {k: v for k, v in tokens.items() 
+              if datetime.fromisoformat(v) > now}
+    with open(TOKEN_FILE, 'w') as f:
+        json.dump(tokens, f)
+
+# Clean expired tokens periodically
+clean_expired_tokens()
+
+# Check for token in query parameters
+query_params = st.query_params
+auth_token = query_params.get("auth_token", None)
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+# Validate token if present
+if auth_token and validate_token(auth_token):
+    st.session_state.authenticated = True
+
+# Password authentication
+if not st.session_state.authenticated:
+    password = st.text_input("Enter password to access dashboard:", type="password")
+    if password == PASSWORD:
+        st.session_state.authenticated = True
+        # Generate and save token
+        new_token = generate_token()
+        save_token(new_token)
+        # Set token in query params
+        st.query_params["auth_token"] = new_token
+        st.success("Access granted. Welcome!")
+        st.rerun()
+    elif password:
+        st.error("Incorrect password")
+    st.stop()
+
+# Set page configuration
 st.set_page_config(
-    page_title="NBFC Lending Business Calculator",
-    page_icon="💰",
-    layout="wide"
+    page_title="Brand Dashboards",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-.main-header {
-    background: linear-gradient(90deg, #2E8B57, #4169E1);
-    padding: 20px;
-    border-radius: 10px;
-    color: white;
-    text-align: center;
-    margin-bottom: 20px;
-}
-.metric-container {
-    background-color: #f0f2f6;
-    padding: 15px;
-    border-radius: 8px;
-    border-left: 4px solid #2E8B57;
-    margin: 5px 0;
-}
-.calculation-header {
-    background-color: #e1f5fe;
-    padding: 10px;
-    border-radius: 5px;
-    margin: 10px 0;
-}
-</style>
-""", unsafe_allow_html=True)
+# Metabase Configuration
+METABASE_URL = "http://43.205.95.106:3000"
+METABASE_USERNAME = "shubham.garg@fintechcloud.in"
+METABASE_PASSWORD = "Qwerty@12345"
 
-# Title
-st.markdown("""
-<div class="main-header">
-    <h1>💰 NBFC Lending Business Calculator</h1>
-</div>
-""", unsafe_allow_html=True)
+# Function to get Metabase session token with retry logic
+def get_metabase_token_with_retry(max_retries=3):
+    """Get authentication token from Metabase with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                f"{METABASE_URL}/api/session",
+                json={
+                    "username": METABASE_USERNAME,
+                    "password": METABASE_PASSWORD
+                },
+                timeout=15
+            )
+            if response.status_code == 200:
+                token = response.json()['id']
+                return token
+            else:
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Wait before retry
+                    continue
+                return None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2)  # Wait before retry
+                continue
+            return None
+    return None
 
-# Sidebar for all inputs
-st.sidebar.markdown("# 🎛️ Input Business Parameters")
+# Cache the token but with shorter TTL and allow refresh
+@st.cache_data(ttl=1800, show_spinner=False)  # Cache for 30 minutes
+def get_metabase_token():
+    """Get authentication token from Metabase"""
+    return get_metabase_token_with_retry()
 
-# Number of months selection at the top
-st.sidebar.markdown("## 📅 Projection Period")
-num_months = st.sidebar.number_input("Number of Months", min_value=1, max_value=48, value=12, step=1)
-
-# Capital Deployment Parameters
-st.sidebar.markdown("## 💰 Capital Deployment (₹ Crores)")
-
-# Create dynamic capital inputs based on number of months
-capital_values = []
-if num_months <= 12:
-    # Two columns for 12 or fewer months
-    cap_col1, cap_col2 = st.sidebar.columns(2)
-    for i in range(num_months):
-        month_num = i + 1
-        if month_num <= 5:
-            default_val = [5.0, 4.0, 4.0, 4.0, 3.0][i] if month_num <= 5 else 0.0
-        else:
-            default_val = 0.0
+# Function to fetch data from Metabase with retry and better error handling
+def fetch_metabase_metric_v2(card_id, token, max_retries=2):
+    """
+    Fetch using /query/json endpoint with retry logic
+    """
+    if not token:
+        return "Auth Error"
+    
+    for attempt in range(max_retries):
+        try:
+            headers = {
+                "X-Metabase-Session": token,
+                "Content-Type": "application/json"
+            }
             
-        if i % 2 == 0:
-            with cap_col1:
-                val = st.number_input(f"Month {month_num}", min_value=0.0, max_value=20.0, value=default_val, step=0.5, key=f"cap_{month_num}")
-        else:
-            with cap_col2:
-                val = st.number_input(f"Month {month_num}", min_value=0.0, max_value=20.0, value=default_val, step=0.5, key=f"cap_{month_num}")
-        capital_values.append(val)
-else:
-    # Single column for more than 12 months
-    for i in range(num_months):
-        month_num = i + 1
-        if month_num <= 5:
-            default_val = [5.0, 4.0, 4.0, 4.0, 3.0][i]
-        else:
-            default_val = 0.0
-        val = st.sidebar.number_input(f"Month {month_num}", min_value=0.0, max_value=20.0, value=default_val, step=0.5, key=f"cap_{month_num}")
-        capital_values.append(val)
+            response = requests.post(
+                f"{METABASE_URL}/api/card/{card_id}/query/json",
+                headers=headers,
+                json={"parameters": []},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if isinstance(data, list) and len(data) > 0:
+                    first_row = data[0]
+                    if isinstance(first_row, dict):
+                        value = list(first_row.values())[0] if first_row else None
+                    else:
+                        value = first_row
+                    
+                    if value is None:
+                        return "₹0.00"
+                    
+                    if isinstance(value, (int, float)):
+                        if value >= 10000000:  # 1 Crore
+                            return f"₹{value/10000000:.2f} Cr"
+                        elif value >= 100000:  # 1 Lakh
+                            return f"₹{value/100000:.2f} L"
+                        else:
+                            return f"₹{value:,.0f}"
+                    return str(value)
+                
+                return "₹0.00"
+            
+            elif response.status_code == 401:
+                # Token expired, force refresh
+                st.cache_data.clear()
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    # Get new token
+                    new_token = get_metabase_token_with_retry()
+                    if new_token:
+                        token = new_token
+                        continue
+                return "Auth Error"
+            
+            else:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return f"Error {response.status_code}"
+                
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return "Timeout"
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return "Error"
+    
+    return "Error"
 
-# Create individual variables for backward compatibility
-for i in range(48):  # Create all possible month variables
-    if i < len(capital_values):
-        globals()[f"month{i+1}_capital"] = capital_values[i]
+# Function to fetch collection percentage
+def fetch_collection_percentage(card_id, token, max_retries=2):
+    """
+    Fetch collection percentage from Metabase with retry logic
+    """
+    if not token:
+        return "N/A"
+    
+    for attempt in range(max_retries):
+        try:
+            headers = {
+                "X-Metabase-Session": token,
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(
+                f"{METABASE_URL}/api/card/{card_id}/query/json",
+                headers=headers,
+                json={"parameters": []},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if isinstance(data, list) and len(data) > 0:
+                    first_row = data[0]
+                    if isinstance(first_row, dict):
+                        value = list(first_row.values())[0] if first_row else None
+                    else:
+                        value = first_row
+                    
+                    if value is None:
+                        return "0%"
+                    
+                    if isinstance(value, (int, float)):
+                        return f"{value:.1f}%"
+                    return str(value)
+                
+                return "0%"
+            
+            elif response.status_code == 401:
+                # Token expired
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    new_token = get_metabase_token_with_retry()
+                    if new_token:
+                        token = new_token
+                        continue
+                return "N/A"
+            
+            else:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return "N/A"
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return "N/A"
+    
+    return "N/A"
+
+# Function to calculate total from metric values
+def parse_metric_value(value_str):
+    """Parse formatted metric value back to number"""
+    if isinstance(value_str, str):
+        if "Error" in value_str or value_str == "Coming Soon" or "Auth" in value_str or value_str == "Timeout":
+            return 0
+        # Remove currency symbol and spaces
+        value_str = value_str.replace('₹', '').replace(',', '').strip()
+        # Handle Cr and L suffixes
+        if 'Cr' in value_str:
+            return float(value_str.replace('Cr', '').strip()) * 10000000
+        elif 'L' in value_str:
+            return float(value_str.replace('L', '').strip()) * 100000
+        else:
+            try:
+                return float(value_str)
+            except:
+                return 0
+    return 0
+
+def format_total(value):
+    """Format total value"""
+    if value >= 10000000:  # 1 Crore
+        return f"₹{value/10000000:.2f} Cr"
+    elif value >= 100000:  # 1 Lakh
+        return f"₹{value/100000:.2f} L"
     else:
-        globals()[f"month{i+1}_capital"] = 0.0
+        return f"₹{value:,.0f}"
 
-total_capital = sum(capital_values)
+# Custom CSS for KPI card style
+st.markdown("""
+    <style>
+    /* Import Google Fonts */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+    
+    /* Global Styles */
+    * {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    /* Override Streamlit's default backgrounds */
+    .stApp {
+        background: #ffffff;
+    }
+    
+    .main {
+        background: transparent;
+        padding: 0;
+    }
+    
+    .block-container {
+        padding: 2rem 3rem;
+        max-width: 1600px;
+        background: transparent;
+    }
+    
+    /* Ensure all parent elements have white background */
+    section[data-testid="stAppViewContainer"] {
+        background: #ffffff;
+    }
+    
+    [data-testid="stHeader"] {
+        background: transparent;
+    }
+    
+    /* Header Styling */
+    .header-section {
+        margin-bottom: 3rem;
+        padding-bottom: 1.5rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        position: relative;
+    }
+    
+    .header-left {
+        flex: 1;
+        text-align: center;
+    }
+    
+    .header-left-score {
+        position: absolute;
+        left: 3rem;
+        top: 2rem;
+    }
+    
+    .sg-score-card {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #2563eb;
+        background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+        padding: 0.75rem 1.5rem;
+        border-radius: 12px;
+        border: 2px solid #3b82f6;
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2);
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    
+    .sg-score-value {
+        font-size: 1.1rem;
+        font-weight: 800;
+        color: #1e40af;
+    }
+    
+    .header-right {
+        position: absolute;
+        right: 3rem;
+        top: 2rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+    
+    .current-date {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: #64748b;
+        background: #f1f5f9;
+        padding: 0.75rem 1.5rem;
+        border-radius: 12px;
+        border: 2px solid #e2e8f0;
+    }
+    
+    .days-left {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #f59e0b;
+        background: #fef3c7;
+        padding: 0.5rem 1rem;
+        border-radius: 10px;
+        border: 2px solid #fbbf24;
+        text-align: center;
+    }
+    
+    .main-title {
+        font-size: 3.5rem;
+        font-weight: 900;
+        color: #2563eb;
+        margin-bottom: 1rem;
+        letter-spacing: -1px;
+        line-height: 1.1;
+    }
+    
+    .title-underline {
+        width: 240px;
+        height: 6px;
+        background: linear-gradient(to right, #3b82f6, #8b5cf6);
+        border-radius: 3px;
+        margin: 0 auto;
+    }
+    
+    /* Brand Card Container */
+    .brand-card-container {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        margin-bottom: 0.75rem;
+    }
+    
+    /* Individual Brand Card */
+    .brand-card {
+        border-radius: 16px;
+        padding: 1.25rem;
+        position: relative;
+        overflow: hidden;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        cursor: pointer;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+        height: 280px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+    
+    .brand-card:hover {
+        transform: translateY(-8px);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+    }
+    
+    /* Card Colors */
+    .card-blue {
+        background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    }
+    
+    .card-green {
+        background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    }
+    
+    .card-orange {
+        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    }
+    
+    .card-teal {
+        background: linear-gradient(135deg, #14b8a6 0%, #0d9488 100%);
+    }
+    
+    .card-purple {
+        background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
+    }
+    
+    .card-indigo {
+        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+    }
+    
+    .card-red {
+        background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    }
+    
+    .card-pink {
+        background: linear-gradient(135deg, #ec4899 0%, #db2777 100%);
+    }
+    
+    /* Card Header */
+    .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 0.5rem;
+    }
+    
+    .card-label {
+        font-size: 1.1rem;
+        font-weight: 800;
+        color: rgba(255, 255, 255, 0.95);
+        text-transform: capitalize;
+        letter-spacing: 0.3px;
+    }
+    
+    .card-icon {
+        font-size: 1.5rem;
+        background: rgba(255, 255, 255, 0.25);
+        padding: 0.4rem;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 40px;
+        min-height: 40px;
+    }
+    
+    /* Card Content */
+    .card-brand-name {
+        font-size: 1.5rem;
+        font-weight: 800;
+        color: white;
+        margin-bottom: 0.3rem;
+        line-height: 1.2;
+    }
+    
+    .card-description {
+        font-size: 0.9rem;
+        color: rgba(255, 255, 255, 0.95);
+        font-weight: 600;
+        margin-bottom: 0.2rem;
+    }
+    
+    .card-target {
+        font-size: 0.85rem;
+        color: rgba(255, 255, 255, 0.85);
+        font-weight: 500;
+        margin-bottom: 0.2rem;
+    }
+    
+    .card-metric {
+        font-size: 0.88rem;
+        color: rgba(255, 255, 255, 1);
+        font-weight: 800;
+        background: rgba(255, 255, 255, 0.25);
+        padding: 0.35rem 0.7rem;
+        border-radius: 8px;
+        display: inline-block;
+        margin-top: 0.25rem;
+        margin-right: 0.35rem;
+        border: 2px solid rgba(255, 255, 255, 0.3);
+        line-height: 1.3;
+    }
+    
+    /* Link styling */
+    a {
+        text-decoration: none !important;
+        color: inherit !important;
+    }
+    
+    /* Hide Streamlit elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    .stDeployButton {display:none;}
+    header {visibility: hidden;}
+    
+    /* Column styling */
+    [data-testid="column"] {
+        padding: 0 0.4rem;
+    }
+    
+    /* Responsive */
+    @media (max-width: 768px) {
+        .header-section {
+            flex-direction: column;
+            gap: 1rem;
+        }
+        
+        .header-left-score {
+            position: relative;
+            left: auto;
+            top: auto;
+            margin-bottom: 1rem;
+        }
+        
+        .header-right {
+            position: relative;
+            right: auto;
+            top: auto;
+        }
+        
+        .brand-card {
+            padding: 1.5rem;
+            min-height: 200px;
+        }
+        .card-brand-name {
+            font-size: 1.5rem;
+        }
+        .main-title {
+            font-size: 2.5rem;
+        }
+        .title-underline {
+            width: 150px;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# Business Parameters
-st.sidebar.markdown("## 📈 Revenue Parameters")
-processing_fees = st.sidebar.number_input("Processing Fees (%)", min_value=5.0, max_value=25.0, value=11.8, step=0.1) / 100
-monthly_interest_rate = st.sidebar.number_input("Monthly Interest Rate (%)", min_value=15.0, max_value=50.0, value=30.0, step=0.5) / 100
-marketing_rate = st.sidebar.number_input("Marketing Expenses (%)", min_value=1.0, max_value=5.0, value=2.0, step=0.1) / 100
-cost_of_funds_rate = st.sidebar.number_input("Cost of Funds (% monthly)", min_value=0.5, max_value=5.0, value=1.5, step=0.1) / 100
+# Get current date and calculate days left in month
+ist_timezone = ZoneInfo("Asia/Kolkata")
+now = datetime.now(ist_timezone)
+current_date = now.strftime("%d %B %Y")
+current_day = now.day
+days_in_month = calendar.monthrange(now.year, now.month)[1]
+days_left = days_in_month - current_day
 
-# Operational expense rates
-st.sidebar.markdown("## 🏢 Operational Expenses (%)")
-opex_month1_value = st.sidebar.number_input("Month 1 OpEx (₹)", 1000000, 5000000, 1500000, 50000)
-opex_month1 = opex_month1_value / 1e7  # Convert to crores for consistency
+# Get Metabase token
+metabase_token = get_metabase_token()
 
-# Create dynamic OPEX inputs based on number of months (starting from month 2)
-opex_values = [opex_month1]  # Month 1 is already handled above
-for i in range(1, num_months):  # Start from month 2
-    month_num = i + 1
-    if month_num <= 3:
-        default_val = 10.0
-    elif month_num <= 5:
-        default_val = 5.0
+# Define brand dashboards with colors and Metabase card IDs
+brand_dashboards = [
+    {
+        "name": "FundoBaBa",
+        "url": "https://tinyurl.com/5n9abwcx",
+        "icon": "💼",
+        "description": "Mumbai Team",
+        "target": "₹25 Cr",
+        "target_value": 25,
+        "metabase_card_id": 441,
+        "pmtd_card_id": 456,
+        "collection_card_id": 453,
+        "metric_label": "MTD Disb",
+        "color": "blue"
+    },
+    {
+        "name": "FastPaise",
+        "url": "https://tinyurl.com/59dtjd88",
+        "icon": "⚡",
+        "description": "Ashutosh",
+        "target": "₹18 Cr",
+        "target_value": 18,
+        "metabase_card_id": 432,
+        "pmtd_card_id": 460,
+        "collection_card_id": 445,
+        "metric_label": "MTD Disb",
+        "color": "green"
+    },
+    {
+        "name": "SnapPaisa",
+        "url": "https://tinyurl.com/2p9mdevt",
+        "icon": "📸",
+        "description": "Mumbai Team",
+        "target": "₹18 Cr",
+        "target_value": 18,
+        "metabase_card_id": 437,
+        "pmtd_card_id": 464,
+        "collection_card_id": 449,
+        "metric_label": "MTD Disb",
+        "color": "purple"
+    },
+    {
+        "name": "BlinkR",
+        "url": "",
+        "icon": "⚡",
+        "description": "Anurag",
+        "target": "₹15 Cr",
+        "target_value": 15,
+        "metabase_card_id": None,
+        "pmtd_card_id": None,
+        "collection_card_id": None,
+        "metric_label": "MTD Disb",
+        "color": "indigo",
+        "manual_mtd": 65049130,
+        "manual_pmtd": 49800000,
+        "manual_collection": "83.0%"
+    },
+    {
+        "name": "Duniya",
+        "url": "https://tinyurl.com/nhzvpuy6",
+        "icon": "🌍",
+        "description": "Harsh",
+        "target": "₹15 Cr",
+        "target_value": 15,
+        "metabase_card_id": 433,
+        "pmtd_card_id": 459,
+        "collection_card_id": 444,
+        "metric_label": "MTD Disb",
+        "color": "blue"
+    },
+    {
+        "name": "Tejas",
+        "url": "https://tinyurl.com/29sb8js4",
+        "icon": "✨",
+        "description": "Nitin",
+        "target": "₹15 Cr",
+        "target_value": 15,
+        "metabase_card_id": 439,
+        "pmtd_card_id": 466,
+        "collection_card_id": 451,
+        "metric_label": "MTD Disb",
+        "color": "red"
+    },
+    {
+        "name": "Salary 4 Sure",
+        "url": "https://tinyurl.com/bdfdufas",
+        "icon": "💸",
+        "description": "Vivek & Pranit",
+        "target": "₹15 Cr",
+        "target_value": 15,
+        "metabase_card_id": 436,
+        "pmtd_card_id": 463,
+        "collection_card_id": 448,
+        "metric_label": "MTD Disb",
+        "color": "orange"
+    },
+    {
+        "name": "Salary Setu",
+        "url": "https://tinyurl.com/2we6eyvf",
+        "icon": "💵",
+        "description": "Prajwal",
+        "target": "₹11 Cr",
+        "target_value": 11,
+        "metabase_card_id": 443,
+        "pmtd_card_id": 458,
+        "collection_card_id": 455,
+        "metric_label": "MTD Disb",
+        "color": "green"
+    },
+    {
+        "name": "Salary Adda",
+        "url": "https://tinyurl.com/4cd79c5b",
+        "icon": "💳",
+        "description": "Asim",
+        "target": "₹10 Cr",
+        "target_value": 10,
+        "metabase_card_id": 442,
+        "pmtd_card_id": 457,
+        "collection_card_id": 454,
+        "metric_label": "MTD Disb",
+        "color": "teal"
+    },
+    {
+        "name": "Zepto Finance",
+        "url": "https://tinyurl.com/44cj83rw",
+        "icon": "⚡",
+        "description": "Arvind Jaiswal",
+        "target": "₹9 Cr",
+        "target_value": 9,
+        "metabase_card_id": 440,
+        "secondary_mtd_card_id": 476,
+        "pmtd_card_id": 467,
+        "secondary_pmtd_card_id": 477,
+        "collection_card_id": 452,
+        "metric_label": "MTD Disb",
+        "color": "pink"
+    },
+    {
+        "name": "Paisa on Salary",
+        "url": "https://tinyurl.com/fpxzjfsk",
+        "icon": "💰",
+        "description": "Ajay",
+        "target": "₹5 Cr",
+        "target_value": 5,
+        "metabase_card_id": 435,
+        "pmtd_card_id": 462,
+        "collection_card_id": 447,
+        "metric_label": "MTD Disb",
+        "color": "teal"
+    },
+    {
+        "name": "Squid Loan",
+        "url": "https://tinyurl.com/mphk5xpc",
+        "icon": "🦑",
+        "description": "Shashikant",
+        "target": "₹5 Cr",
+        "target_value": 5,
+        "metabase_card_id": 438,
+        "pmtd_card_id": 465,
+        "collection_card_id": 450,
+        "metric_label": "MTD Disb",
+        "color": "indigo"
+    },
+    {
+        "name": "Jhatpat",
+        "url": "https://tinyurl.com/294bc6ns",
+        "icon": "🚀",
+        "description": "Vivek",
+        "target": "₹3 Cr",
+        "target_value": 3,
+        "metabase_card_id": 434,
+        "pmtd_card_id": 461,
+        "collection_card_id": 446,
+        "metric_label": "MTD Disb",
+        "color": "orange"
+    },
+    {
+        "name": "Minutes Loan",
+        "url": "https://tinyurl.com/yj3mss22",
+        "icon": "⏱️",
+        "description": "Pranit",
+        "target": "₹3 Cr",
+        "target_value": 3,
+        "metabase_card_id": 470,
+        "pmtd_card_id": 471,
+        "collection_card_id": None,
+        "metric_label": "MTD Disb",
+        "color": "indigo"
+    },
+    {
+        "name": "Paisa Pop",
+        "url": "https://tinyurl.com/4jd65fut",
+        "icon": "🎈",
+        "description": "Priyanka",
+        "target": "₹3 Cr",
+        "target_value": 3,
+        "metabase_card_id": 473,
+        "pmtd_card_id": 474,
+        "collection_card_id": None,
+        "metric_label": "MTD Disb",
+        "color": "pink"
+    },
+    {
+        "name": "Qua Loans",
+        "url": "https://tinyurl.com/bdhj328e",
+        "icon": "🔷",
+        "description": "Harsha & Nitin",
+        "target": "₹3 Cr",
+        "target_value": 3,
+        "metabase_card_id": None,
+        "pmtd_card_id": None,
+        "collection_card_id": None,
+        "metric_label": "MTD Disb",
+        "color": "blue",
+        "manual_mtd": 26458000,
+        "manual_pmtd": 14700000,
+        "manual_collection": "74.0%"
+    },
+    {
+        "name": "Salary 4 You",
+        "url": "https://tinyurl.com/p43ptyp4",
+        "icon": "💵",
+        "description": "Nadeem",
+        "target": "₹3 Cr",
+        "target_value": 3,
+        "metabase_card_id": 486,
+        "pmtd_card_id": 488,
+        "collection_card_id": 491,
+        "metric_label": "MTD Disb",
+        "color": "green"
+    },
+    {
+        "name": "Udhaar Portal",
+        "url": "https://tinyurl.com/wb6n38dx",
+        "icon": "🏦",
+        "description": "Manas",
+        "target": "₹1 Cr",
+        "target_value": 1,
+        "metabase_card_id": 498,
+        "pmtd_card_id": 500,
+        "collection_card_id": 499,
+        "metric_label": "MTD Disb",
+        "color": "teal"
+    },
+    {
+        "name": "Rupee Hype",
+        "url": "https://tinyurl.com/39ztaew8",
+        "icon": "🚀",
+        "description": "Nadeem",
+        "target": "₹1 Cr",
+        "target_value": 1,
+        "metabase_card_id": 485,
+        "pmtd_card_id": 487,
+        "collection_card_id": 492,
+        "metric_label": "MTD Disb",
+        "color": "purple"
+    }
+]
+
+# Fetch all metrics and calculate totals - NO PROGRESS BAR
+total_disbursement = 0
+total_pmtd_disbursement = 0
+brand_metrics = {}
+brand_pmtd_metrics = {}
+brand_collections = {}
+brand_yet_to_achieve = {}
+
+for brand in brand_dashboards:
+    # Check if this is a manual entry brand
+    if brand.get('manual_mtd') is not None:
+        mtd_disb_value = brand['manual_mtd']
+        brand_metrics[brand['name']] = format_total(mtd_disb_value)
+        total_disbursement += mtd_disb_value
+        
+        # Calculate Yet to Achieve
+        target_value = brand['target_value'] * 10000000
+        yet_to_achieve = target_value - mtd_disb_value
+        yet_to_achieve_pct = (yet_to_achieve / target_value * 100) if target_value > 0 else 0
+        
+        if yet_to_achieve > 0:
+            brand_yet_to_achieve[brand['name']] = f"{format_total(yet_to_achieve)} ({yet_to_achieve_pct:.0f}%)"
+        else:
+            brand_yet_to_achieve[brand['name']] = "Target Achieved! 🎉"
+        
+        # PMTD for manual entry
+        if brand.get('manual_pmtd') is not None:
+            pmtd_disb_value = brand['manual_pmtd']
+            brand_pmtd_metrics[brand['name']] = format_total(pmtd_disb_value)
+            total_pmtd_disbursement += pmtd_disb_value
+        else:
+            brand_pmtd_metrics[brand['name']] = "Coming Soon"
+        
+        # Collection for manual entry
+        if brand.get('manual_collection') is not None:
+            brand_collections[brand['name']] = brand['manual_collection']
+        else:
+            brand_collections[brand['name']] = "N/A"
+    
     else:
-        default_val = 4.0
-    val = st.sidebar.number_input(f"Month {month_num} OpEx Rate (%)", min_value=0.0, max_value=30.0, value=default_val, step=0.5, key=f"opex_{month_num}") / 100
-    opex_values.append(val)
+        # Fetch MTD Disbursement from Metabase
+        if brand['metabase_card_id']:
+            metric_value = fetch_metabase_metric_v2(brand['metabase_card_id'], metabase_token)
+            mtd_disb_value = parse_metric_value(metric_value)
+            
+            # Add secondary MTD card if exists
+            if brand.get('secondary_mtd_card_id'):
+                secondary_metric_value = fetch_metabase_metric_v2(brand['secondary_mtd_card_id'], metabase_token)
+                mtd_disb_value += parse_metric_value(secondary_metric_value)
+            
+            brand_metrics[brand['name']] = format_total(mtd_disb_value)
+            total_disbursement += mtd_disb_value
+            
+            # Calculate Yet to Achieve
+            target_value = brand['target_value'] * 10000000
+            yet_to_achieve = target_value - mtd_disb_value
+            yet_to_achieve_pct = (yet_to_achieve / target_value * 100) if target_value > 0 else 0
+            
+            if yet_to_achieve > 0:
+                brand_yet_to_achieve[brand['name']] = f"{format_total(yet_to_achieve)} ({yet_to_achieve_pct:.0f}%)"
+            else:
+                brand_yet_to_achieve[brand['name']] = "Target Achieved! 🎉"
+        else:
+            brand_metrics[brand['name']] = "Coming Soon"
+            brand_yet_to_achieve[brand['name']] = "N/A"
+        
+        # Fetch PMTD Disbursement
+        if brand['pmtd_card_id']:
+            pmtd_value = fetch_metabase_metric_v2(brand['pmtd_card_id'], metabase_token)
+            pmtd_disb_value = parse_metric_value(pmtd_value)
+            
+            if brand.get('secondary_pmtd_card_id'):
+                secondary_pmtd_value = fetch_metabase_metric_v2(brand['secondary_pmtd_card_id'], metabase_token)
+                pmtd_disb_value += parse_metric_value(secondary_pmtd_value)
+            
+            brand_pmtd_metrics[brand['name']] = format_total(pmtd_disb_value)
+            total_pmtd_disbursement += pmtd_disb_value
+        else:
+            brand_pmtd_metrics[brand['name']] = "Coming Soon"
+        
+        # Fetch Collection %
+        if brand['collection_card_id']:
+            collection_value = fetch_collection_percentage(brand['collection_card_id'], metabase_token)
+            brand_collections[brand['name']] = collection_value
+        else:
+            brand_collections[brand['name']] = "N/A"
 
-# Create individual variables for backward compatibility
-for i in range(48):  # Create all possible month variables
-    if i < len(opex_values):
-        globals()[f"opex_month{i+1}"] = opex_values[i]
+# Calculate total target
+total_target = sum([brand['target_value'] for brand in brand_dashboards])
+
+# Calculate MoM Growth
+mom_growth = total_disbursement - total_pmtd_disbursement
+mom_growth_percentage = (mom_growth / total_pmtd_disbursement * 100) if total_pmtd_disbursement > 0 else 0
+
+# Calculate Total MTD Target based on current day
+def calculate_mtd_target(current_day, total_target_cr):
+    """Calculate MTD Target based on the day of month"""
+    total_target_amount = total_target_cr * 10000000
+    
+    if 1 <= current_day <= 5:
+        mtd_percentage = 21.23 * (current_day / 5) / 100
+    elif 6 <= current_day <= 10:
+        days_in_bracket = current_day - 5
+        mtd_percentage = (21.23 + 11.61 * (days_in_bracket / 5)) / 100
+    elif 11 <= current_day <= 15:
+        days_in_bracket = current_day - 10
+        mtd_percentage = (21.23 + 11.61 + 8.13 * (days_in_bracket / 5)) / 100
+    elif 16 <= current_day <= 20:
+        days_in_bracket = current_day - 15
+        mtd_percentage = (21.23 + 11.61 + 8.13 + 7.75 * (days_in_bracket / 5)) / 100
+    elif 21 <= current_day <= 25:
+        days_in_bracket = current_day - 20
+        mtd_percentage = (21.23 + 11.61 + 8.13 + 7.75 + 12.96 * (days_in_bracket / 5)) / 100
     else:
-        globals()[f"opex_month{i+1}"] = 0.04  # Default 4%
+        days_in_month = calendar.monthrange(now.year, now.month)[1]
+        days_in_bracket = current_day - 25
+        total_days_in_bracket = days_in_month - 25
+        mtd_percentage = (21.23 + 11.61 + 8.13 + 7.75 + 12.96 + 38.31 * (days_in_bracket / total_days_in_bracket)) / 100
+    
+    return total_target_amount * mtd_percentage
 
-# Loan parameters
-st.sidebar.markdown("## 🎯 Loan Parameters")
-avg_ticket_size = st.sidebar.number_input("Average Loan Ticket (₹)", 10000, 50000, 22000, 1000)
+mtd_target_amount = calculate_mtd_target(current_day, total_target)
+mtd_shortfall = mtd_target_amount - total_disbursement
+shortfall_percentage = (abs(mtd_shortfall) / mtd_target_amount * 100) if mtd_target_amount > 0 else 0
 
-# Collection parameters
-st.sidebar.markdown("## 📊 Collection Parameters")
-t0_collection = st.sidebar.number_input("T+0 Collection Rate (%)", min_value=0, max_value=100, value=80, step=1) / 100
-t30_collection = st.sidebar.number_input("T+30 Collection Rate (%)", min_value=0, max_value=100, value=5, step=1) / 100
-t60_collection = st.sidebar.number_input("T+60 Collection Rate (%)", min_value=0, max_value=100, value=5, step=1) / 100
-t90_collection = st.sidebar.number_input("T+90 Collection Rate (%)", min_value=0, max_value=100, value=3, step=1) / 100
+sg_score = "₹137 Cr"
 
-# Validation for collection rates
-total_collection_rate_percent = (t0_collection + t30_collection + t60_collection + t90_collection) * 100
-if total_collection_rate_percent > 100:
-    st.sidebar.error(f"⚠️ Total collection rate is {total_collection_rate_percent:.1f}% - should not exceed 100%")
-else:
-    st.sidebar.success(f"✅ Total collection rate: {total_collection_rate_percent:.1f}%")
+# Header
+st.markdown(f"""
+    <div class="header-section">
+        <div class="header-left-score">
+            <div class="sg-score-card">
+                <span>⭐ Month-End Projection:</span>
+                <span class="sg-score-value">{sg_score}</span>
+            </div>
+        </div>
+        <div class="header-left">
+            <div class="main-title">Performance Console</div>
+            <div class="title-underline"></div>
+        </div>
+        <div class="header-right">
+            <div class="current-date">📅 {current_date}</div>
+            <div class="days-left">⏰ {days_left} days left in month</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-# API costs
-api_cost_80_percent = st.sidebar.number_input("API Cost (Per Lead Not Converted) ₹", 20, 100, 35, 5)
-api_cost_20_percent = st.sidebar.number_input("API Cost (Per Converted Customers) ₹", 50, 150, 95, 5)
+# Display summary cards
+cols = st.columns(3, gap="medium")
 
-# Fixed costs
-st.sidebar.markdown("## 💳 Monthly Principal Return (₹ Crores)")
+with cols[0]:
+    st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); 
+                    border-radius: 20px; 
+                    padding: 2rem; 
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+                    border: 2px solid rgba(255, 255, 255, 0.1);
+                    height: 380px;
+                    display: flex;
+                    flex-direction: column;">
+            <div style="font-size: 1.5rem; color: #ffffff; font-weight: 800; margin-bottom: 1.5rem; text-align: center;">
+                🌍 Monthly Goal Status
+            </div>
+            <div style="flex-grow: 1; display: flex; flex-direction: column; justify-content: center; gap: 1rem;">
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Total Target</div>
+                    <div style="font-size: 1.8rem; font-weight: 900; color: #3b82f6;">₹{total_target} Cr</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Total MTD Disbursement</div>
+                    <div style="font-size: 1.8rem; font-weight: 900; color: #10b981;">{format_total(total_disbursement)}</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Achievement</div>
+                    <div style="font-size: 2rem; font-weight: 900; color: {'#10b981' if total_disbursement >= total_target * 10000000 else '#f59e0b'};">
+                        {(total_disbursement / (total_target * 10000000) * 100):.1f}%
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# Create dynamic principal return inputs based on number of months
-principal_values = []
-if num_months <= 12:
-    # Two columns for 12 or fewer months
-    prin_col1, prin_col2 = st.sidebar.columns(2)
-    for i in range(num_months):
-        month_num = i + 1
-        if i % 2 == 0:
-            with prin_col1:
-                val = st.number_input(f"Month {month_num} PR", min_value=0.0, value=0.0, step=0.1, key=f"prin_{month_num}")
-        else:
-            with prin_col2:
-                val = st.number_input(f"Month {month_num} PR", min_value=0.0, value=0.0, step=0.1, key=f"prin_{month_num}")
-        principal_values.append(val)
-else:
-    # Single column for more than 12 months
-    for i in range(num_months):
-        month_num = i + 1
-        val = st.sidebar.number_input(f"Month {month_num} PR", min_value=0.0, value=0.0, step=0.1, key=f"prin_{month_num}")
-        principal_values.append(val)
+with cols[1]:
+    st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); 
+                    border-radius: 20px; 
+                    padding: 2rem; 
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+                    border: 2px solid rgba(255, 255, 255, 0.1);
+                    height: 380px;
+                    display: flex;
+                    flex-direction: column;">
+            <div style="font-size: 1.5rem; color: #ffffff; font-weight: 800; margin-bottom: 1.5rem; text-align: center;">
+                📈 Monthly Shortfall
+            </div>
+            <div style="flex-grow: 1; display: flex; flex-direction: column; justify-content: center; gap: 1rem;">
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Total MTD Target</div>
+                    <div style="font-size: 1.8rem; font-weight: 900; color: #3b82f6;">{format_total(mtd_target_amount)}</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Total MTD Disbursement</div>
+                    <div style="font-size: 1.8rem; font-weight: 900; color: #10b981;">{format_total(total_disbursement)}</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Shortfall (Amount and %)</div>
+                    <div style="font-size: 2rem; font-weight: 900; color: {'#ef4444' if mtd_shortfall > 0 else '#10b981'};">
+                        {format_total(abs(mtd_shortfall))}
+                    </div>
+                    <div style="font-size: 1.1rem; color: rgba(255, 255, 255, 0.8); font-weight: 700; margin-top: 0.3rem;">
+                        {'↓' if mtd_shortfall > 0 else '↑'} {shortfall_percentage:.1f}%
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# Create individual variables for backward compatibility
-for i in range(48):  # Create all possible month variables
-    if i < len(principal_values):
-        globals()[f"month{i+1}_principal"] = principal_values[i]
+with cols[2]:
+    st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); 
+                    border-radius: 20px; 
+                    padding: 2rem; 
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+                    border: 2px solid rgba(255, 255, 255, 0.1);
+                    height: 380px;
+                    display: flex;
+                    flex-direction: column;">
+            <div style="font-size: 1.5rem; color: #ffffff; font-weight: 800; margin-bottom: 1.5rem; text-align: center;">
+                🏆 MoM Growth
+            </div>
+            <div style="flex-grow: 1; display: flex; flex-direction: column; justify-content: center; gap: 1rem;">
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Total PMTD Disbursement</div>
+                    <div style="font-size: 1.8rem; font-weight: 900; color: #8b5cf6;">{format_total(total_pmtd_disbursement)}</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">Total MTD Disbursement</div>
+                    <div style="font-size: 1.8rem; font-weight: 900; color: #10b981;">{format_total(total_disbursement)}</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); font-weight: 600;">MOM Growth (Amount and %)</div>
+                    <div style="font-size: 2rem; font-weight: 900; color: {'#10b981' if mom_growth >= 0 else '#ef4444'};">
+                        {format_total(abs(mom_growth))}
+                    </div>
+                    <div style="font-size: 1.1rem; color: rgba(255, 255, 255, 0.8); font-weight: 700; margin-top: 0.3rem;">
+                        {'↑' if mom_growth >= 0 else '↓'} {abs(mom_growth_percentage):.1f}%
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# Create brand cards
+for i in range(0, len(brand_dashboards), 4):
+    cols = st.columns(4, gap="large")
+    
+    for j in range(4):
+        if i + j < len(brand_dashboards):
+            brand = brand_dashboards[i + j]
+            
+            metric_value = brand_metrics.get(brand['name'], "Coming Soon")
+            collection_value = brand_collections.get(brand['name'], "N/A")
+            yet_to_achieve_value = brand_yet_to_achieve.get(brand['name'], "N/A")
+            
+            with cols[j]:
+                st.markdown(f"""
+                    <a href="{brand['url']}" target="_blank">
+                        <div class="brand-card card-{brand['color']}">
+                            <div class="card-header">
+                                <div class="card-label">{brand['name']}</div>
+                                <div class="card-icon">{brand['icon']}</div>
+                            </div>
+                            <div>
+                                <div class="card-description">👤 {brand['description']}</div>
+                                <div class="card-target">🎯 Target: {brand['target']}</div>
+                                <div style="display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem;">
+                                    <div class="card-metric">📊 {brand['metric_label']}: {metric_value}</div>
+                                    <div class="card-metric">💰 Collection MTD: {collection_value}</div>
+                                </div>
+                                <div style="margin-top: 0.25rem;">
+                                    <div class="card-metric">🎯 Yet to Achieve: {yet_to_achieve_value}</div>
+                                </div>
+                            </div>
+                        </div>
+                    </a>
+                    """, unsafe_allow_html=True)
+    
+    if i + 4 < len(brand_dashboards):
+        st.markdown("<br>", unsafe_allow_html=True)
+
+# Add sidebar with connection info and refresh button
+with st.sidebar:
+    st.markdown("### 🔧 System Status")
+    
+    if metabase_token:
+        st.success("✅ Metabase Connected")
     else:
-        globals()[f"month{i+1}_principal"] = 0.0
-
-# EXACT calculation function using your formulas
-def calculate_with_exact_formulas():
-    months = num_months  # Use dynamic number of months
+        st.error("❌ Connection Failed")
+        st.warning("Try refreshing the page or check your network")
     
-    # Capital deployment schedule - use actual number of months
-    capital_invested = [capital_values[i] * 1e7 if i < len(capital_values) else 0 for i in range(months)]
+    st.markdown("---")
     
-    # OPEX rates array - use actual number of months
-    opex_rates = [opex_values[i] if i < len(opex_values) else 0.04 for i in range(months)]
+    if st.button("🔄 Force Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
     
-    # Principal return array - use actual number of months (convert from crores to rupees)
-    principal_returns = [principal_values[i] * 1e7 if i < len(principal_values) else 0 for i in range(months)]
-    
-    # Initialize arrays to store all calculations
-    amount_invested = []
-    amount_available = []
-    amount_disbursed = []
-    customers = []
-    opex = []
-    api_expense = []
-    marketing_expense = []
-    cost_of_funds = []
-    bad_debt_default = []
-    gst = []
-    salary = []
-    principal_return = []
-    interest_revenue = []
-    bad_debt_recovery = []
-    processing_fees_revenue = []
-    profit_loss = []
-    aum = []
-    
-    for month in range(months):
-        # Amount Invested
-        amount_invested.append(capital_invested[month])
-        
-        # Amount Available for Disbursal
-        if month == 0:
-            available = capital_invested[month]
-        else:
-            prev_profit = profit_loss[month-1]
-            available = amount_available[month-1] + prev_profit + capital_invested[month]
-        
-        amount_available.append(available)
-        
-        # Amount Actually Disbursed = Amount Available / (1 - Processing Fees)
-        disbursed = available / (1 - processing_fees)
-        amount_disbursed.append(disbursed)
-        
-        # Number of Customers
-        num_customers = int(disbursed / avg_ticket_size)
-        customers.append(num_customers)
-        
-        # Operational Expenses
-        if month == 0:
-            op_expense = opex_month1_value  # Use editable value for month 1
-        else:
-            prev_aum = aum[month-1]
-            op_expense = prev_aum * opex_rates[month]
-        
-        opex.append(op_expense)
-        
-        # API Cost
-        api_cost = (num_customers * 2 * api_cost_20_percent) + (num_customers * 8 * api_cost_80_percent)
-        api_expense.append(api_cost)
-        
-        # Marketing Expense
-        marketing_exp = disbursed * marketing_rate
-        marketing_expense.append(marketing_exp)
-        
-        # Cost of Funds (quarterly calculation - adapted for variable months)
-        cost_of_funds_expense = 0
-        # Calculate cost of funds for quarters that are complete within the selected months
-        if month == 2 and months >= 3:  # Month 3 (Q1) - if we have at least 3 months
-            cost_q1_m1 = capital_invested[0] * cost_of_funds_rate
-            cost_q1_m2 = sum(capital_invested[:2]) * cost_of_funds_rate  
-            cost_q1_m3 = sum(capital_invested[:3]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q1_m1 + cost_q1_m2 + cost_q1_m3
-        elif month == 5 and months >= 6:  # Month 6 (Q2) - if we have at least 6 months
-            cost_q2_m4 = sum(capital_invested[:4]) * cost_of_funds_rate
-            cost_q2_m5 = sum(capital_invested[:5]) * cost_of_funds_rate
-            cost_q2_m6 = sum(capital_invested[:6]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q2_m4 + cost_q2_m5 + cost_q2_m6
-        elif month == 8 and months >= 9:  # Month 9 (Q3) - if we have at least 9 months
-            cost_q3_m7 = sum(capital_invested[:7]) * cost_of_funds_rate
-            cost_q3_m8 = sum(capital_invested[:8]) * cost_of_funds_rate
-            cost_q3_m9 = sum(capital_invested[:9]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q3_m7 + cost_q3_m8 + cost_q3_m9
-        elif month == 11 and months >= 12:  # Month 12 (Q4) - if we have at least 12 months
-            cost_q4_m10 = sum(capital_invested[:10]) * cost_of_funds_rate
-            cost_q4_m11 = sum(capital_invested[:11]) * cost_of_funds_rate
-            cost_q4_m12 = sum(capital_invested[:12]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q4_m10 + cost_q4_m11 + cost_q4_m12
-        # Add additional quarters for periods longer than 12 months
-        elif month == 14 and months >= 15:  # Month 15 (Q5)
-            cost_q5_m13 = sum(capital_invested[:13]) * cost_of_funds_rate
-            cost_q5_m14 = sum(capital_invested[:14]) * cost_of_funds_rate
-            cost_q5_m15 = sum(capital_invested[:15]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q5_m13 + cost_q5_m14 + cost_q5_m15
-        elif month == 17 and months >= 18:  # Month 18 (Q6)
-            cost_q6_m16 = sum(capital_invested[:16]) * cost_of_funds_rate
-            cost_q6_m17 = sum(capital_invested[:17]) * cost_of_funds_rate
-            cost_q6_m18 = sum(capital_invested[:18]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q6_m16 + cost_q6_m17 + cost_q6_m18
-        # Continue pattern for longer periods - every 3rd month starting from month 3
-        elif (month + 1) % 3 == 0 and month >= 2 and months > month:  # General quarterly calculation
-            quarter_start = month - 2
-            cost_q_m1 = sum(capital_invested[:quarter_start+1]) * cost_of_funds_rate
-            cost_q_m2 = sum(capital_invested[:quarter_start+2]) * cost_of_funds_rate
-            cost_q_m3 = sum(capital_invested[:quarter_start+3]) * cost_of_funds_rate
-            cost_of_funds_expense = cost_q_m1 + cost_q_m2 + cost_q_m3
-        
-        cost_of_funds.append(cost_of_funds_expense)
-        
-        # Interest calculation (split across two months)
-        if month == 0:
-            interest = (disbursed * monthly_interest_rate) / 2
-        else:
-            current_month_interest = (disbursed * monthly_interest_rate) / 2
-            prev_month_interest = (amount_disbursed[month-1] * monthly_interest_rate) / 2
-            interest = current_month_interest + prev_month_interest
-        
-        interest_revenue.append(interest)
-        
-        # Bad Debt Default = (Amount Disbursed + Interest) × (1 - T+0 Collection Rate)
-        bad_debt = (disbursed + interest) * (1 - t0_collection)
-        bad_debt_default.append(bad_debt)
-        
-        # Recovery of Bad Debt
-        recovery = 0
-        if month >= 1:
-            prev_disbursed_plus_interest = amount_disbursed[month-1] + interest_revenue[month-1]
-            recovery += prev_disbursed_plus_interest * t30_collection
-        if month >= 2:
-            prev2_disbursed_plus_interest = amount_disbursed[month-2] + interest_revenue[month-2]
-            recovery += prev2_disbursed_plus_interest * t60_collection
-        if month >= 3:
-            prev3_disbursed_plus_interest = amount_disbursed[month-3] + interest_revenue[month-3]
-            recovery += prev3_disbursed_plus_interest * t90_collection
-        
-        bad_debt_recovery.append(recovery)
-        
-        # Processing Fees
-        pf = disbursed * processing_fees
-        processing_fees_revenue.append(pf)
-        
-        # GST
-        gst_amount = pf * (18/118)
-        gst.append(gst_amount)
-        
-        # Fixed costs
-        monthly_salary = 0  # Fixed at 0 since removed from inputs
-        salary.append(monthly_salary)
-        principal_return.append(principal_returns[month])
-        
-        # Profit/Loss
-        profit = (interest + recovery + pf) - (op_expense + api_cost + marketing_exp + cost_of_funds_expense + bad_debt + gst_amount + monthly_salary + principal_returns[month])
-        profit_loss.append(profit)
-        
-        # AUM = Amount Actually Disbursed + Interest
-        aum_value = disbursed + interest
-        aum.append(aum_value)
-    
-    # Create DataFrame with dynamic number of months
-    df = pd.DataFrame({
-        'month': range(1, months + 1),
-        'amount_invested': [x/1e7 for x in amount_invested],
-        'amount_available': [x/1e7 for x in amount_available],
-        'amount_disbursed': [x/1e7 for x in amount_disbursed],
-        'customers': customers,
-        'opex': [x/1e7 for x in opex],
-        'api_expense': [x/1e7 for x in api_expense],
-        'marketing_expense': [x/1e7 for x in marketing_expense],
-        'cost_of_funds': [x/1e7 for x in cost_of_funds],
-        'bad_debt_default': [x/1e7 for x in bad_debt_default],
-        'gst': [x/1e7 for x in gst],
-        'salary': [x/1e7 for x in salary],
-        'principal_return': [x/1e7 for x in principal_return],
-        'interest_revenue': [x/1e7 for x in interest_revenue],
-        'bad_debt_recovery': [x/1e7 for x in bad_debt_recovery],
-        'processing_fees_revenue': [x/1e7 for x in processing_fees_revenue],
-        'profit_loss': [x/1e7 for x in profit_loss],
-        'aum': [x/1e7 for x in aum]
-    })
-    
-    return df
-
-# Calculate derived metrics
-# Time-weighted investment calculation for variable months
-sum_annual_investment = 0
-for i, capital in enumerate(capital_values):
-    months_remaining = num_months - i
-    weight = months_remaining / num_months
-    sum_annual_investment += capital * weight
-
-# Calculate projections first to get final month values
-df = calculate_with_exact_formulas()
-
-# Calculate Actual Period ROI (not annualized)
-final_month_aum = df['aum'].iloc[-1]
-if sum_annual_investment > 0:
-    period_roi = ((final_month_aum - sum_annual_investment) / sum_annual_investment) * 100
-else:
-    period_roi = 0
-
-# Display key metrics
-col1, col2, col3, col4, col5 = st.columns(5)
-
-with col1:
-    st.metric("💰 Capital Invested", f"₹{total_capital:.1f} Cr")
-    
-with col2:
-    st.metric("📈 Period ROI", f"{period_roi:.1f}%")
-    
-with col3:
-    final_month_disbursed = df['amount_disbursed'].iloc[-1]
-    st.metric(f"📊 Month {num_months} Disbursed", f"₹{final_month_disbursed:.2f} Cr")
-    
-with col4:
-    final_month_profit = df['profit_loss'].iloc[-1]
-    st.metric(f"🎯 Month {num_months} Profit", f"₹{final_month_profit:.2f} Cr")
-    
-with col5:
-    final_month_aum = df['aum'].iloc[-1]
-    st.metric(f"🏆 Month {num_months} AUM", f"₹{final_month_aum:.2f} Cr")
-
-# Charts
-st.markdown("---")
-st.markdown("## 📈 Business Analysis Charts")
-
-# Row 1: AUM Chart and Monthly Revenue vs Cost Analysis (side by side)
-col1, col2 = st.columns(2)
-
-with col1:
-    # 1. AUM Growth Analysis
-    fig_aum_growth = px.area(
-        df,
-        x='month',
-        y='aum',
-        title="Assets Under Management (AUM) Growth",
-        color_discrete_sequence=['#4169E1']
-    )
-    fig_aum_growth.update_layout(
-        xaxis_title="Month",
-        yaxis_title="AUM (₹ Crores)",
-        height=400
-    )
-    fig_aum_growth.update_xaxes(dtick=1)  # Show every month
-    fig_aum_growth.update_traces(hovertemplate='Month %{x}<br>AUM: ₹%{y:.2f} Cr<extra></extra>')
-    st.plotly_chart(fig_aum_growth, use_container_width=True)
-
-with col2:
-    # 2. Revenue vs Costs
-    fig_revenue_costs = go.Figure()
-
-    # Calculate revenue and costs
-    total_revenue = df['interest_revenue'] + df['processing_fees_revenue'] + df['bad_debt_recovery']
-    total_costs = (df['opex'] + df['api_expense'] + df['marketing_expense'] + 
-                   df['cost_of_funds'] + df['bad_debt_default'] + df['gst'] + 
-                   df['salary'] + df['principal_return'])
-
-    fig_revenue_costs.add_trace(go.Bar(
-        x=df['month'],
-        y=total_revenue,
-        name='Total Revenue',
-        marker_color='#2E8B57',
-        hovertemplate='Month %{x}<br>Revenue: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_revenue_costs.add_trace(go.Bar(
-        x=df['month'],
-        y=total_costs,
-        name='Total Costs',
-        marker_color='#FF6B6B',
-        hovertemplate='Month %{x}<br>Costs: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_revenue_costs.add_trace(go.Scatter(
-        x=df['month'],
-        y=df['profit_loss'],
-        mode='lines+markers',
-        name='Net Profit',
-        line=dict(color='#FFD700', width=4),
-        marker=dict(size=10),
-        hovertemplate='Month %{x}<br>Profit: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_revenue_costs.update_layout(
-        title="Monthly Revenue vs Costs Analysis",
-        xaxis_title="Month",
-        yaxis_title="Amount (₹ Crores)",
-        hovermode='x unified',
-        height=400
-    )
-    fig_revenue_costs.update_xaxes(dtick=1)  # Show every month
-
-    st.plotly_chart(fig_revenue_costs, use_container_width=True)
-
-# Row 2: Monthly Profit/Loss Analysis (full width)
-# 3. Profit/Loss Analysis
-fig_profit = px.bar(
-    df,
-    x='month',
-    y='profit_loss',
-    title="Monthly Profit/Loss Analysis",
-    color='profit_loss',
-    color_continuous_scale=['red', 'yellow', 'green']
-)
-fig_profit.update_layout(
-    xaxis_title="Month",
-    yaxis_title="Profit/Loss (₹ Crores)",
-    height=400,
-    showlegend=False
-)
-fig_profit.update_xaxes(dtick=1)  # Show every month
-fig_profit.update_traces(hovertemplate='Month %{x}<br>Profit/Loss: ₹%{y:.2f} Cr<extra></extra>')
-st.plotly_chart(fig_profit, use_container_width=True)
-
-# Row 3: Amount Invested vs Available and Amount Disbursed (side by side)
-col1, col2 = st.columns(2)
-
-with col1:
-    # 4. Amount Invested vs Available for Disbursal - Both as bars
-    fig_invested_vs_available = go.Figure()
-
-    fig_invested_vs_available.add_trace(go.Bar(
-        x=df['month'],
-        y=df['amount_invested'],
-        name='Amount Invested',
-        marker_color='#4169E1',
-        hovertemplate='Month %{x}<br>Invested: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_invested_vs_available.add_trace(go.Bar(
-        x=df['month'],
-        y=df['amount_available'],
-        name='Available for Disbursal',
-        marker_color='#2E8B57',
-        hovertemplate='Month %{x}<br>Available: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_invested_vs_available.update_layout(
-        title="Amount Invested vs Available for Disbursal",
-        xaxis_title="Month",
-        yaxis_title="Amount (₹ Crores)",
-        hovermode='x unified',
-        height=400,
-        barmode='group'
-    )
-    fig_invested_vs_available.update_xaxes(dtick=1)  # Show every month
-
-    st.plotly_chart(fig_invested_vs_available, use_container_width=True)
-
-with col2:
-    # 5. Amount Actually Disbursed vs Month
-    fig_disbursed = px.line(
-        df,
-        x='month',
-        y='amount_disbursed',
-        title="Amount Actually Disbursed",
-        markers=True,
-        color_discrete_sequence=['#2E8B57']
-    )
-    fig_disbursed.update_layout(
-        xaxis_title="Month",
-        yaxis_title="Amount Disbursed (₹ Crores)",
-        height=400
-    )
-    fig_disbursed.update_xaxes(dtick=1)  # Show every month
-    fig_disbursed.update_traces(hovertemplate='Month %{x}<br>Disbursed: ₹%{y:.2f} Cr<extra></extra>')
-    st.plotly_chart(fig_disbursed, use_container_width=True)
-
-# Row 4: Revenue Breakdown and Customer Acquisition (side by side)
-col1, col2 = st.columns(2)
-
-with col1:
-    # 6. Revenue Breakdown
-    fig_revenue_breakdown = go.Figure()
-
-    fig_revenue_breakdown.add_trace(go.Bar(
-        x=df['month'],
-        y=df['interest_revenue'],
-        name='Interest Revenue',
-        marker_color='#2E8B57',
-        hovertemplate='Month %{x}<br>Interest: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_revenue_breakdown.add_trace(go.Bar(
-        x=df['month'],
-        y=df['processing_fees_revenue'],
-        name='Processing Fees',
-        marker_color='#4169E1',
-        hovertemplate='Month %{x}<br>Processing Fees: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_revenue_breakdown.add_trace(go.Bar(
-        x=df['month'],
-        y=df['bad_debt_recovery'],
-        name='Bad Debt Recovery',
-        marker_color='#FF8C00',
-        hovertemplate='Month %{x}<br>Recovery: ₹%{y:.2f} Cr<extra></extra>'
-    ))
-
-    fig_revenue_breakdown.update_layout(
-        title="Monthly Revenue Breakdown",
-        xaxis_title="Month",
-        yaxis_title="Amount (₹ Crores)",
-        barmode='stack',
-        height=400
-    )
-    fig_revenue_breakdown.update_xaxes(dtick=1)  # Show every month
-
-    st.plotly_chart(fig_revenue_breakdown, use_container_width=True)
-
-with col2:
-    # 7. Customer Acquisition
-    fig_customers = px.bar(
-        df,
-        x='month',
-        y='customers',
-        title="Monthly Customer Acquisition",
-        color='customers',
-        color_continuous_scale='viridis'
-    )
-    fig_customers.update_layout(
-        xaxis_title="Month",
-        yaxis_title="Number of Customers",
-        height=400,
-        showlegend=False
-    )
-    fig_customers.update_xaxes(dtick=1)  # Show every month
-    fig_customers.update_traces(hovertemplate='Month %{x}<br>Customers: %{y:,.0f}<extra></extra>')
-    st.plotly_chart(fig_customers, use_container_width=True)
-
-# Complete calculations table
-st.markdown("---")
-st.markdown("## 📋 Complete Monthly Calculations")
-
-# Round for display
-display_df = df.round(3)
-
-# Rename columns for better readability and remove salary
-column_names = {
-    'month': 'Month',
-    'amount_invested': 'Invested (₹Cr)',
-    'amount_available': 'Available (₹Cr)',
-    'amount_disbursed': 'Disbursed (₹Cr)',
-    'customers': 'Customers',
-    'opex': 'OpEx (₹Cr)',
-    'api_expense': 'API (₹Cr)',
-    'marketing_expense': 'Marketing (₹Cr)',
-    'cost_of_funds': 'Cost of Funds (₹Cr)',
-    'bad_debt_default': 'Bad Debt (₹Cr)',
-    'gst': 'GST (₹Cr)',
-    'interest_revenue': 'Interest (₹Cr)',
-    'bad_debt_recovery': 'Recovery (₹Cr)',
-    'processing_fees_revenue': 'PF (₹Cr)',
-    'principal_return': 'Principal Return (₹Cr)',
-    'profit_loss': 'Profit (₹Cr)',
-    'aum': 'AUM (₹Cr)'
-}
-
-# Remove salary column and rename
-display_df = display_df.drop('salary', axis=1)
-display_df = display_df.rename(columns=column_names)
-st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
-
-# Summary and export
-st.markdown("---")
-st.markdown("## 📊 Financial Summary")
-
-st.markdown(f"### 💰 {num_months}-Month Summary")
-total_revenue_sum = total_revenue.sum()
-total_costs_sum = total_costs.sum()
-net_profit_sum = df['profit_loss'].sum()
-final_aum = df['aum'].iloc[-1]
-final_month_available = df['amount_available'].iloc[-1]
-total_customers_sum = df['customers'].sum()
-final_month_aum_summary = df['aum'].iloc[-1]
-
-st.write(f"**Capital Invested:** ₹{total_capital:.2f} Cr")
-st.write(f"**Month {num_months} Available for Disbursal:** ₹{final_month_available:.2f} Cr")
-st.write(f"**Month {num_months} AUM:** ₹{final_month_aum_summary:.2f} Cr")
-st.write(f"**Total Profit/Loss ({num_months} months):** ₹{net_profit_sum:.2f} Cr")
-st.write(f"**Total Customers:** {total_customers_sum:,}")
-st.write(f"**Total Revenue:** ₹{total_revenue_sum:.2f} Cr")
-st.write(f"**Total Costs:** ₹{total_costs_sum:.2f} Cr")
-#st.write(f"**Profit Margin:** {(net_profit_sum/total_revenue_sum*100):.1f}%")
+    st.markdown("---")
+    st.caption(f"Last Updated: {datetime.now(ist_timezone).strftime('%H:%M:%S')}")
